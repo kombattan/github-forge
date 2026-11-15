@@ -1,49 +1,70 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// The forge's HTTP server: one dispatcher for the four surfaces the suite
+// drives — git smart HTTP at /{owner}/{repo}.git, REST v3 under /api/v3,
+// GraphQL at /api/graphql and MCP at /mcp — plus the env's /healthz probe.
+// Every surface but /healthz requires the trial's bearer token; a missing
+// or wrong token is a 401 JSON body, and anything unknown is a JSON 404.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// app.ts is deliberately separate from main.ts: this is the server, the
+// file that grows; main.ts is the entry <-> env lifecycle and stays as it is.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { authorized, makeCtx, readBody, sendError, sendJson, type Ctx } from './lib/http.ts';
+import { handleRest } from './lib/rest.ts';
+import { handleGit } from './lib/git-http.ts';
+import { handleGraphql } from './lib/graphql.ts';
+import { handleMcp } from './lib/mcp.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+/** Route one request to its surface. */
+async function dispatch(ctx: Ctx): Promise<void> {
+  const seg = ctx.segments;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+  // The env's boot check: no auth, always the same answer.
+  if (ctx.method === 'GET' && ctx.path === '/healthz') {
+    sendJson(ctx, 200, { ok: true });
+    return;
   }
+
+  if (!authorized(ctx)) {
+    sendError(ctx, 401, 'Requires authentication');
+    return;
+  }
+
+  if (seg[0] === 'api' && seg[1] === 'v3') {
+    handleRest(ctx);
+    return;
+  }
+  if (seg[0] === 'api' && seg[1] === 'graphql') {
+    await handleGraphql(ctx);
+    return;
+  }
+  if (seg[0] === 'mcp') {
+    await handleMcp(ctx);
+    return;
+  }
+  // Git smart HTTP lives at /{owner}/{repo}.git/...
+  if (seg.length >= 2 && (seg[1] as string).endsWith('.git')) {
+    handleGit(ctx);
+    return;
+  }
+  sendError(ctx, 404, 'Not Found');
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+/** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+    void (async () => {
+      try {
+        const body = await readBody(req);
+        const ctx = makeCtx(req, res, body);
+        await dispatch(ctx);
+      } catch {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+          res.end('{"message":"Internal Server Error"}\n');
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+      }
+    })();
   });
 }
