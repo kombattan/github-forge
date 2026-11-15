@@ -48,7 +48,7 @@ function commitTime(repo: RepoRec, sha: string): number {
 }
 
 /** All objects reachable from a set of commits: the "already known" closure. */
-function fullClosure(repo: RepoRec, tips: string[], into: Set<string>): void {
+function fullClosure(repo: RepoRec, tips: string[], into: Set<string>, stopAt?: Set<string>): void {
   const stack = [...tips];
   while (stack.length > 0) {
     const sha = stack.pop() as string;
@@ -58,7 +58,10 @@ function fullClosure(repo: RepoRec, tips: string[], into: Set<string>): void {
     into.add(sha);
     if (object.type === 'commit') {
       const info = parseCommit(object.data);
-      stack.push(info.tree, ...info.parents);
+      stack.push(info.tree);
+      // A commit the client holds only as a shallow boundary is known
+      // itself, but its ancestry is exactly what it does not have.
+      if (stopAt === undefined || !stopAt.has(sha)) stack.push(...info.parents);
     } else if (object.type === 'tree') {
       for (const entry of treeEntries(repo, sha)) stack.push(entry.sha);
     } else if (object.type === 'tag') {
@@ -130,6 +133,8 @@ interface FetchRequest {
 
 interface FetchPlan {
   objects: GitObject[];
+  /** The included objects' shas, in pack order: the pack cache key. */
+  key: string;
   shallow: string[];
   unshallow: string[];
   common: string[];
@@ -137,19 +142,17 @@ interface FetchPlan {
 
 /** Work out exactly which objects a fetch sends, and its shallow boundary. */
 function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
+  const shallowSet = new Set(request.clientShallow);
   const known = new Set<string>();
-  fullClosure(repo, request.haves, known);
+  fullClosure(repo, request.haves, known, shallowSet);
   for (const ref of request.deepenNot) {
     const tip = store.branchTip(repo, ref.replace(/^refs\/heads\//, '')) ?? repo.refs.get(ref);
     if (tip !== undefined) fullClosure(repo, [tip], known);
   }
-  // The client's shallow boundary: it holds those commits but not their
-  // ancestry, so the ancestry below them is known too.
-  const belowShallow = new Set<string>();
-  for (const sha of request.clientShallow) {
-    const object = getObject(repo, sha);
-    if (object !== null && object.type === 'commit') fullClosure(repo, parseCommit(object.data).parents, belowShallow);
-  }
+  // The client's shallow boundary needs no exclusion of its own: the
+  // depth limit below already keeps ancestry past the boundary out, and
+  // when a deepen reaches past a boundary commit, that commit's parents
+  // are exactly what must be sent (and the commit reported unshallowed).
 
   const included = new Map<string, GitObject>();
   const includedCommits = new Set<string>();
@@ -176,6 +179,10 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
   };
 
   // Breadth-first over commits so depth counts generations from the wants.
+  // The walk goes through commits the client already has — a shallow
+  // boundary named as a have is the classic case — leaving known objects
+  // out of the pack but still reaching the generations below them, which
+  // is exactly what a deepen asks for.
   const queue: { sha: string; generation: number }[] = [];
   const seen = new Set<string>();
   for (const want of request.wants) {
@@ -189,36 +196,32 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
     const { sha, generation } = queue.shift() as { sha: string; generation: number };
     if (seen.has(sha)) continue;
     seen.add(sha);
-    if (known.has(sha) || belowShallow.has(sha)) continue;
     const object = getObject(repo, sha);
     if (object === null || object.type !== 'commit') continue;
     const info = parseCommit(object.data);
-    if (request.deepenSince !== null && commitTime(repo, sha) < request.deepenSince) {
-      continue;
+    const withinSince = request.deepenSince === null || commitTime(repo, sha) >= request.deepenSince;
+    const isIncluded = !known.has(sha) && withinSince;
+    if (isIncluded) {
+      includedCommits.add(sha);
+      includeObject(sha);
+      includeTree(info.tree, 0);
     }
-    includedCommits.add(sha);
-    includeObject(sha);
-    includeTree(info.tree, 0);
-    let cut = false;
     for (const parent of info.parents) {
       if (getObject(repo, parent) === null) continue;
-      if (request.depth !== null && generation + 1 >= request.depth) {
-        cut = true;
-        continue;
+      const parentWithinDepth = request.depth === null || generation + 1 < request.depth;
+      const parentWithinSince = request.deepenSince === null || commitTime(repo, parent) >= request.deepenSince;
+      if (parentWithinDepth && parentWithinSince) {
+        queue.push({ sha: parent, generation: generation + 1 });
+      } else if (isIncluded && !known.has(parent)) {
+        // A parent exists but the depth/since gate cut it off: this
+        // commit is the shallow boundary of the new pack.
+        boundary.add(sha);
       }
-      if (request.deepenSince !== null && commitTime(repo, parent) < request.deepenSince) {
-        cut = true;
-        continue;
-      }
-      queue.push({ sha: parent, generation: generation + 1 });
     }
-    if (cut && info.parents.length > 0) boundary.add(sha);
-    if (request.depth !== null && generation + 1 >= request.depth && info.parents.length > 0) boundary.add(sha);
   }
 
   const unshallow: string[] = [];
   for (const sha of request.clientShallow) {
-    if (!includedCommits.has(sha)) continue;
     const object = getObject(repo, sha);
     if (object === null || object.type !== 'commit') continue;
     const parents = parseCommit(object.data).parents;
@@ -227,10 +230,31 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
 
   return {
     objects: [...included.values()],
+    key: [...included.keys()].join(' '),
     shallow: [...boundary],
     unshallow,
     common: request.haves.filter((sha) => getObject(repo, sha) !== null),
   };
+}
+
+/**
+ * Pack buffers repeat constantly in a trial (fifty clones of one repo ask
+ * for the same objects), and a pack is a pure function of its object list,
+ * which is content-addressed: memoize built packs by their object shas.
+ */
+const packCache = new Map<string, Buffer>();
+
+/** Build (or fetch from the cache) the pack for a fetch plan. */
+function packFor(plan: FetchPlan): Buffer {
+  const cached = packCache.get(plan.key);
+  if (cached !== undefined) return cached;
+  const pack = buildPack(plan.objects);
+  if (packCache.size >= 128) {
+    const oldest = packCache.keys().next().value;
+    if (oldest !== undefined) packCache.delete(oldest);
+  }
+  packCache.set(plan.key, pack);
+  return pack;
 }
 
 /** Frame pack bytes as sideband-64k packets (band 1), chunked well under the limit. */
@@ -407,7 +431,7 @@ function uploadPack(ctx: Ctx, repo: RepoRec): void {
         parts.push(pktDelim());
       }
       parts.push(pktLine('packfile\n'));
-      parts.push(...sidebandPackets(buildPack(plan.objects)));
+      parts.push(...sidebandPackets(packFor(plan)));
       parts.push(pktFlush());
       return sendBytes(ctx, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
     }
@@ -423,7 +447,7 @@ function uploadPack(ctx: Ctx, repo: RepoRec): void {
   for (const sha of plan.unshallow) parts.push(pktLine(`unshallow ${sha}\n`));
   if (plan.common.length > 0) parts.push(pktLine(`ACK ${plan.common[0]}\n`));
   else parts.push(pktLine('NAK\n'));
-  parts.push(...sidebandPackets(buildPack(plan.objects)));
+  parts.push(...sidebandPackets(packFor(plan)));
   parts.push(pktFlush());
   return sendBytes(ctx, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
 }
