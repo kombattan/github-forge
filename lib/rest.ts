@@ -602,6 +602,7 @@ function handlePulls(ctx: Ctx, repo: RepoRec, seg: string[], body: Record<string
         baseSha,
         merged: false,
         mergeCommitSha: null,
+        comments: [],
         user: VIEWER.login,
         createdAt: now,
         updatedAt: now,
@@ -671,19 +672,15 @@ export function refreshPull(repo: RepoRec, pull: PullRec): PullRec {
 }
 
 /**
- * Squash-merge a pull request: a three-way tree merge against the merge
- * base; a file changed on both sides with different results is a conflict
- * (405). On success the base branch advances to one new commit whose tree
- * is the merged tree and whose only parent is the old base tip.
+ * The three-way tree merge at a pull's heart: returns the merged
+ * path -> blob-sha map, or null when a file changed on both sides with
+ * different results (a conflict).
  */
-function mergePullRoute(ctx: Ctx, repo: RepoRec, pull: PullRec, body: Record<string, unknown>): void {
+export function mergedTreeMap(repo: RepoRec, pull: PullRec): Map<string, string> | null {
   const current = refreshPull(repo, pull);
-  if (current.state !== 'open' || current.merged) {
-    return sendError(ctx, 405, 'Pull Request is not mergeable');
-  }
   const baseTip = store.branchTip(repo, current.baseRef);
   const headTip = store.branchTip(repo, current.headRef);
-  if (baseTip === null || headTip === null) return sendError(ctx, 405, 'Pull Request is not mergeable');
+  if (baseTip === null || headTip === null) return null;
   const base = store.mergeBase(repo, baseTip, headTip);
   const baseFiles = filesAt(repo, base ?? baseTip);
   const ourFiles = filesAt(repo, baseTip);
@@ -701,13 +698,33 @@ function mergePullRoute(ctx: Ctx, repo: RepoRec, pull: PullRec, body: Record<str
     } else if (inBase === inTheirs) {
       if (inOurs !== undefined) merged.set(path, inOurs);
     } else {
-      return sendError(ctx, 405, 'Pull Request has merge conflicts');
+      return null;
     }
   }
+  return merged;
+}
+
+/** True when a pull's three-way merge conflicts (or its branches are gone). */
+export function pullHasConflict(repo: RepoRec, pull: PullRec): boolean {
+  if (pull.state !== 'open') return false;
+  return mergedTreeMap(repo, pull) === null;
+}
+
+/**
+ * Apply the squash merge: one new commit on the base branch whose tree is
+ * the merged tree. Returns the new commit sha, or null when the pull is
+ * not open or the merge conflicts.
+ */
+export function performSquashMerge(repo: RepoRec, pull: PullRec, message?: string): string | null {
+  const current = refreshPull(repo, pull);
+  if (current.state !== 'open' || current.merged) return null;
+  const merged = mergedTreeMap(repo, current);
+  if (merged === null) return null;
+  const baseTip = store.branchTip(repo, current.baseRef);
+  if (baseTip === null) return null;
   const tree = buildTree(repo, merged);
-  const title = str(body, 'commit_title') ?? `${current.title} (#${current.number})`;
-  const message = str(body, 'commit_message') ?? title;
-  const sha = store.commit(repo, tree, [baseTip], message);
+  const text = message ?? `${current.title} (#${current.number})`;
+  const sha = store.commit(repo, tree, [baseTip], text);
   repo.refs.set(`refs/heads/${current.baseRef}`, sha);
   current.state = 'closed';
   current.merged = true;
@@ -715,5 +732,19 @@ function mergePullRoute(ctx: Ctx, repo: RepoRec, pull: PullRec, body: Record<str
   current.baseSha = sha;
   current.updatedAt = store.nowIso();
   repo.updatedAt = current.updatedAt;
+  return sha;
+}
+
+function mergePullRoute(ctx: Ctx, repo: RepoRec, pull: PullRec, body: Record<string, unknown>): void {
+  const current = refreshPull(repo, pull);
+  if (current.state !== 'open' || current.merged) {
+    return sendError(ctx, 405, 'Pull Request is not mergeable');
+  }
+  const title = str(body, 'commit_title') ?? `${current.title} (#${current.number})`;
+  const message = str(body, 'commit_message') ?? title;
+  const sha = performSquashMerge(repo, current, message);
+  if (sha === null) {
+    return sendError(ctx, 405, 'Pull Request has merge conflicts');
+  }
   return sendJson(ctx, 200, { sha, merged: true, message: 'Pull Request successfully merged' });
 }

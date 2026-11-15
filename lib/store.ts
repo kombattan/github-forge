@@ -81,6 +81,7 @@ export interface PullRec {
   baseSha: string;
   merged: boolean;
   mergeCommitSha: string | null;
+  comments: CommentRec[];
   user: string;
   createdAt: string;
   updatedAt: string;

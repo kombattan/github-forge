@@ -21,6 +21,8 @@ export interface Ctx {
   body: Buffer;
   /** Parsed JSON body when it parsed, else undefined. */
   json: Record<string, unknown> | undefined;
+  /** The parsed JSON body exactly as it arrived (arrays included). */
+  jsonRaw: unknown;
   /** True when a body was present but was not valid JSON. */
   jsonError: boolean;
 }
@@ -50,17 +52,19 @@ export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer)
       }
     });
   let json: Record<string, unknown> | undefined;
+  let jsonRaw: unknown;
   let jsonError = false;
   if (body.length > 0) {
     try {
       const parsed: unknown = JSON.parse(body.toString('utf8'));
+      jsonRaw = parsed;
       if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) json = parsed as Record<string, unknown>;
       else json = { value: parsed } as Record<string, unknown>;
     } catch {
       jsonError = true;
     }
   }
-  return { req, res, method: req.method ?? 'GET', segments, path, query: url.searchParams, body, json, jsonError };
+  return { req, res, method: req.method ?? 'GET', segments, path, query: url.searchParams, body, json, jsonRaw, jsonError };
 }
 
 /** Answer with a JSON body and the headers every reply must carry. */
