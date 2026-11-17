@@ -192,8 +192,10 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
     else if (object.type === 'tree') includeTree(want, 0);
     else includeObject(want);
   }
-  while (queue.length > 0) {
-    const { sha, generation } = queue.shift() as { sha: string; generation: number };
+  // An index cursor, not shift(): the walk is breadth-first either way and
+  // a long history must not pay a memmove per commit.
+  for (let head = 0; head < queue.length; head += 1) {
+    const { sha, generation } = queue[head] as { sha: string; generation: number };
     if (seen.has(sha)) continue;
     seen.add(sha);
     const object = getObject(repo, sha);
@@ -269,19 +271,21 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   return packets;
 }
 
+/** The v2 capability advertisement: the same bytes for every repository and every request. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  pktFlush(),
+]);
+
 /** The v0/v2 ref advertisement for one service. */
 function advertisement(ctx: Ctx, repo: RepoRec, service: string): void {
   const version2 = (ctx.req.headers['git-protocol'] ?? '').includes('version=2');
   if (service === 'git-upload-pack' && version2) {
-    const body = Buffer.concat([
-      pktLine('version 2\n'),
-      pktLine(`agent=${AGENT}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow filter\n'),
-      pktLine('object-format=sha1\n'),
-      pktFlush(),
-    ]);
-    return sendBytes(ctx, 200, body, 'application/x-git-upload-pack-advertisement', { 'cache-control': 'no-cache' });
+    return sendBytes(ctx, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement', { 'cache-control': 'no-cache' });
   }
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS_V0 : RECEIVE_CAPS;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];

@@ -32,12 +32,15 @@ function bool(body: Record<string, unknown>, key: string): boolean | null {
   return typeof value === 'boolean' ? value : null;
 }
 
+/** The viewer's node_id: a constant of the trial, encoded once. */
+const USER_NODE_ID = Buffer.from(`04:User${VIEWER.id}`).toString('base64');
+
 /** The viewer's public user object. */
 export function userJson(): Record<string, unknown> {
   return {
     login: VIEWER.login,
     id: VIEWER.id,
-    node_id: Buffer.from(`04:User${VIEWER.id}`).toString('base64'),
+    node_id: USER_NODE_ID,
     avatar_url: '',
     html_url: '',
     type: 'User',

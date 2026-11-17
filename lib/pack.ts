@@ -132,23 +132,134 @@ export function buildPack(objects: GitObject[]): Buffer {
 }
 
 /**
- * Find how many bytes the deflate stream starting at `offset` occupies:
- * inflateSync ignores trailing bytes, so the shortest prefix that inflates
- * is exactly the stream. Binary search keeps this cheap on small objects.
+ * The largest byte count a zlib stream holding `size` inflated bytes can
+ * occupy when an encoder is free to fall back to stored blocks: the 2-byte
+ * wrapper, one stored block per 65,535 payload bytes (5 bytes of block
+ * framing each) and the 4-byte adler32. Real encoders (zlib, git) never
+ * emit more for a single object; a hand-crafted stream could, so callers
+ * treat this as a fast-path bound, never as an assumption.
  */
-function inflatedLength(buffer: Buffer, offset: number): { data: Buffer; consumed: number } {
-  let lo = 1;
-  let hi = buffer.length - offset;
+function storedBound(size: number): number {
+  return size + 5 * Math.max(1, Math.ceil(size / 65535)) + 6;
+}
+
+/** One probe: inflate the prefix of `length` bytes; null when it does not inflate. */
+function tryInflate(buffer: Buffer, offset: number, length: number): Buffer | null {
+  try {
+    return inflateSync(buffer.subarray(offset, offset + length));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The exact byte length of the stream at `offset` when it is stored-format
+ * (BTYPE=00 blocks only — what an encoder emits for incompressible data),
+ * or null when it is anything else. A stored stream's layout is fully
+ * determined by its block headers: the 2-byte zlib wrapper, then per block
+ * a header byte, a 2-byte length and its complement, and the raw payload,
+ * then the 4-byte adler32 — so its length is read, not searched for. The
+ * payload lengths must sum to `size`; any inconsistency means the stream
+ * is not what it claims and null sends the caller back to probing.
+ */
+function storedStreamLength(buffer: Buffer, offset: number, size: number): number | null {
+  let pos = offset + 2; // the zlib wrapper
+  let produced = 0;
+  for (;;) {
+    if (pos + 5 > buffer.length) return null;
+    const header = buffer[pos] as number;
+    const bfinal = header & 0x01;
+    const btype = (header >> 1) & 0x03;
+    if (btype !== 0x00) return null;
+    const length = buffer.readUInt16LE(pos + 1);
+    const complement = buffer.readUInt16LE(pos + 3);
+    if (length !== (~complement & 0xffff)) return null;
+    produced += length;
+    if (produced > size) return null;
+    pos += 5 + length;
+    if (bfinal === 1) break;
+  }
+  if (produced !== size) return null;
+  return pos + 4 - offset; // the adler32
+}
+
+/**
+ * Find how many bytes the deflate stream starting at `offset` occupies and
+ * inflate it: inflateSync ignores trailing bytes, so the shortest prefix
+ * that inflates is exactly the stream.
+ *
+ * The search starts at the stored bound (see storedBound): for the common
+ * case of incompressible data the stream ends exactly there, which two
+ * probes settle — one at the bound (whose result is the object's data) and
+ * one a byte shorter (which must fail). Anything shorter falls back to a
+ * binary search under the bound; anything longer (a stream no real encoder
+ * writes) falls back to a binary search of the whole remainder. `size` is
+ * the object's inflated length from its pack header; `endHint`, when the
+ * caller knows where the stream must end (the last object in a pack ends
+ * 20 bytes before the buffer does, at the pack trailer), is tried first.
+ */
+function inflatedLength(buffer: Buffer, offset: number, size: number, endHint?: number): { data: Buffer; consumed: number } {
+  const remaining = buffer.length - offset;
+  if (endHint !== undefined && endHint > 0 && endHint <= remaining) {
+    const hinted = tryInflate(buffer, offset, endHint);
+    if (hinted !== null && hinted.length === size) return { data: hinted, consumed: endHint };
+  }
+  const bound = Math.min(remaining, storedBound(size));
+  // Stored-format streams (incompressible data) name their own length:
+  // one inflate of exactly that slice settles both data and length.
+  const storedLength = storedStreamLength(buffer, offset, size);
+  if (storedLength !== null && storedLength <= remaining) {
+    const stored = tryInflate(buffer, offset, storedLength);
+    if (stored !== null && stored.length === size) return { data: stored, consumed: storedLength };
+  }
+  let data = tryInflate(buffer, offset, bound);
+  if (data !== null) {
+    // The data is known now; only its stream's exact length is not. One
+    // re-deflate at the default level reproduces the stream byte for byte
+    // for the encoders git clients use — when it matches the pack's bytes,
+    // its length is the answer, with no further probes. A mismatch (some
+    // other level or strategy) just falls through to the probes below.
+    if (data.length === size && bound > 8) {
+      const redeflated = deflateSync(data);
+      if (redeflated.length < bound && buffer.subarray(offset, offset + redeflated.length).equals(redeflated)) {
+        return { data, consumed: redeflated.length };
+      }
+    }
+    if (bound > 1) {
+      if (tryInflate(buffer, offset, bound - 1) === null) return { data, consumed: bound };
+      // Shorter than the bound: binary-search below it for the exact end.
+      let lo = 1;
+      let hi = bound - 1;
+      let best = bound;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const attempt = tryInflate(buffer, offset, mid);
+        if (attempt !== null) {
+          best = mid;
+          data = attempt;
+          hi = mid - 1;
+        } else {
+          lo = mid + 1;
+        }
+      }
+      return { data, consumed: best };
+    }
+    return { data, consumed: bound };
+  }
+  // Past the stored bound: not a stream a real encoder writes, but parse
+  // it anyway with the original whole-remainder binary search.
+  let lo = bound + 1;
+  let hi = remaining;
   let best = -1;
   let bestData: Buffer | null = null;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    try {
-      const data = inflateSync(buffer.subarray(offset, offset + mid));
+    const attempt = tryInflate(buffer, offset, mid);
+    if (attempt !== null) {
       best = mid;
-      bestData = data;
+      bestData = attempt;
       hi = mid - 1;
-    } catch {
+    } else {
       lo = mid + 1;
     }
   }
@@ -226,10 +337,16 @@ export function parsePack(pack: Buffer, resolveBase: (sha: string) => GitObject 
     let byte = pack[offset] as number;
     offset += 1;
     const typeCode = (byte >> 4) & 0x07;
+    let size = byte & 0x0f;
+    let shift = 4;
     while (byte & 0x80) {
       byte = pack[offset] as number;
       offset += 1;
+      size |= (byte & 0x7f) << shift;
+      shift += 7;
     }
+    // The last entry's stream ends where the 20-byte pack trailer begins.
+    const endHint = i === count - 1 ? pack.length - 20 - offset : undefined;
     let entry: RawEntry;
     if (typeCode === 6) {
       // OFS_DELTA: a negative offset varint to the base entry.
@@ -241,19 +358,19 @@ export function parsePack(pack: Buffer, resolveBase: (sha: string) => GitObject 
         offset += 1;
         baseBack = ((baseBack + 1) << 7) | (back & 0x7f);
       }
-      const { data, consumed } = inflatedLength(pack, offset);
+      const { data, consumed } = inflatedLength(pack, offset, size, endHint === undefined ? undefined : pack.length - 20 - offset);
       offset += consumed;
       entry = { type: 'ofs-delta', data, baseOffset: entryOffset - baseBack, entryOffset };
     } else if (typeCode === 7) {
       const baseSha = pack.toString('hex', offset, offset + 20);
       offset += 20;
-      const { data, consumed } = inflatedLength(pack, offset);
+      const { data, consumed } = inflatedLength(pack, offset, size, endHint === undefined ? undefined : pack.length - 20 - offset);
       offset += consumed;
       entry = { type: 'ref-delta', data, baseSha, entryOffset };
     } else {
       const type = CODE_TYPES[typeCode];
       if (type === undefined) throw new Error(`unknown pack object type ${typeCode}`);
-      const { data, consumed } = inflatedLength(pack, offset);
+      const { data, consumed } = inflatedLength(pack, offset, size, endHint);
       offset += consumed;
       entry = { type, data, entryOffset };
     }

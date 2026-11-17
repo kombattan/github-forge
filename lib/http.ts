@@ -32,7 +32,12 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      // The common case is one chunk (or none): hand it over without the
+      // copy Buffer.concat would make of it.
+      if (chunks.length === 1) resolve(chunks[0] as Buffer);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
@@ -41,16 +46,21 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
 export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer): Ctx {
   const url = new URL(req.url ?? '/', 'http://entry');
   const path = url.pathname;
-  const segments = path
-    .split('/')
-    .filter((part) => part !== '')
-    .map((part) => {
-      try {
-        return decodeURIComponent(part);
-      } catch {
-        return part;
-      }
-    });
+  const segments: string[] = [];
+  for (const part of path.split('/')) {
+    if (part === '') continue;
+    // Almost no segment carries an escape; decodeURIComponent's try/catch
+    // is only paid for the ones that do.
+    if (!part.includes('%')) {
+      segments.push(part);
+      continue;
+    }
+    try {
+      segments.push(decodeURIComponent(part));
+    } catch {
+      segments.push(part);
+    }
+  }
   let json: Record<string, unknown> | undefined;
   let jsonRaw: unknown;
   let jsonError = false;
