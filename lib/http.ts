@@ -53,9 +53,28 @@ export function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** Build the handler context for one request. */
-export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer): Ctx {
-  const url = new URL(req.url ?? '/', 'http://entry');
+interface ParsedUrl {
+  path: string;
+  segments: string[];
+  query: URLSearchParams;
+}
+
+/**
+ * URL parses memoize by the raw request target: a trial repeats the same
+ * targets constantly (every advertisement, thousands of reads of one
+ * issue), and WHATWG URL parsing is one of the priciest per-request costs
+ * left. Parsing is deterministic, and handlers only ever read the path,
+ * the segments and the query (never mutate them), so a shared parse is
+ * indistinguishable from a fresh one. Bounded, oldest-first eviction.
+ */
+const urlCache = new Map<string, ParsedUrl>();
+const URL_CACHE_MAX = 512;
+
+/** Parse a request target (memoized: see urlCache). */
+function parseUrl(raw: string): ParsedUrl {
+  const cached = urlCache.get(raw);
+  if (cached !== undefined) return cached;
+  const url = new URL(raw, 'http://entry');
   const path = url.pathname;
   const segments: string[] = [];
   for (const part of path.split('/')) {
@@ -72,6 +91,18 @@ export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer)
       segments.push(part);
     }
   }
+  const parsed: ParsedUrl = { path, segments, query: url.searchParams };
+  if (urlCache.size >= URL_CACHE_MAX) {
+    const oldest = urlCache.keys().next().value;
+    if (oldest !== undefined) urlCache.delete(oldest);
+  }
+  urlCache.set(raw, parsed);
+  return parsed;
+}
+
+/** Build the handler context for one request. */
+export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer): Ctx {
+  const { path, segments, query } = parseUrl(req.url ?? '/');
   let json: Record<string, unknown> | undefined;
   let jsonRaw: unknown;
   let jsonError = false;
@@ -89,7 +120,7 @@ export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer)
       jsonError = true;
     }
   }
-  return { req, res, method: req.method ?? 'GET', segments, path, query: url.searchParams, body, json, jsonRaw, jsonError };
+  return { req, res, method: req.method ?? 'GET', segments, path, query, body, json, jsonRaw, jsonError };
 }
 
 /** Answer with a JSON body and the headers every reply must carry. */

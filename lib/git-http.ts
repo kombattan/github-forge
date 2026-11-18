@@ -8,12 +8,13 @@
 import {
   getObject,
   parseCommit,
+  parseTree,
   store,
   type GitObject,
   type RepoRec,
 } from './store.ts';
 import { sendBytes, sendError, type Ctx } from './http.ts';
-import { buildPack, parseAllPackets, parsePack, parsePackets, pktDelim, pktFlush, pktLine, ZERO_SHA, type Packet } from './pack.ts';
+import { buildPack, parseAllPackets, parsePack, parsePackets, pktDelim, pktFlush, pktLine, writePktLength, ZERO_SHA, type Packet } from './pack.ts';
 
 const AGENT = 'forge/1.0';
 const UPLOAD_CAPS_V0 = 'side-band-64k shallow ofs-delta allow-tip-sha1-in-want';
@@ -24,37 +25,77 @@ function headSha(repo: RepoRec): string {
   return store.branchTip(repo, repo.defaultBranch) ?? ZERO_SHA;
 }
 
+/**
+ * Peel results memoize by sha: objects are content-addressed and
+ * immutable, so a sha's peel is the same in every repository and at every
+ * moment — except a peel that ran into a missing object, whose answer can
+ * change when the object arrives; those are never cached.
+ */
+const peelCache = new Map<string, { sha: string; type: string }>();
+const PEEL_CACHE_MAX = 1024;
+
 /** Peel a tag object chain down to the object it ultimately names. */
 function peel(repo: RepoRec, sha: string): { sha: string; type: string } {
+  const cached = peelCache.get(sha);
+  if (cached !== undefined) return cached;
   let current = sha;
+  let result: { sha: string; type: string } | null = null;
   for (let guard = 0; guard < 16; guard += 1) {
     const object = getObject(repo, current);
     if (object === null) return { sha: current, type: 'unknown' };
-    if (object.type !== 'tag') return { sha: current, type: object.type };
+    if (object.type !== 'tag') {
+      result = { sha: current, type: object.type };
+      break;
+    }
     const match = /^object ([0-9a-f]{40})$/m.exec(object.data.toString('utf8'));
-    if (match === null) return { sha: current, type: 'tag' };
+    if (match === null) {
+      result = { sha: current, type: 'tag' };
+      break;
+    }
     current = match[1] as string;
   }
-  return { sha: current, type: 'tag' };
+  if (result === null) result = { sha: current, type: 'tag' };
+  if (peelCache.size >= PEEL_CACHE_MAX) {
+    const oldest = peelCache.keys().next().value;
+    if (oldest !== undefined) peelCache.delete(oldest);
+  }
+  peelCache.set(sha, result);
+  return result;
 }
+
+/** Committer timestamps memoize by commit buffer identity (see store.ts). */
+const commitTimeCache = new WeakMap<Buffer, number>();
 
 /** The committer timestamp (unix seconds) of a commit, or 0. */
 function commitTime(repo: RepoRec, sha: string): number {
   const object = getObject(repo, sha);
   if (object === null || object.type !== 'commit') return 0;
+  const cached = commitTimeCache.get(object.data);
+  if (cached !== undefined) return cached;
   const line = parseCommit(object.data).committerLine;
   const match = / (\d+) [+-]\d{4}$/.exec(line);
-  return match === null ? 0 : Number(match[1]);
+  const value = match === null ? 0 : Number(match[1]);
+  commitTimeCache.set(object.data, value);
+  return value;
 }
 
-/** All objects reachable from a set of commits: the "already known" closure. */
-function fullClosure(repo: RepoRec, tips: string[], into: Set<string>, stopAt?: Set<string>): void {
+/**
+ * All objects reachable from a set of commits: the "already known" closure.
+ * Returns true when the walk met a sha the store does not hold — the plan
+ * cache needs to know, because such a walk's answer can change when the
+ * missing object later arrives.
+ */
+function fullClosure(repo: RepoRec, tips: string[], into: Set<string>, stopAt?: Set<string>): boolean {
+  let hitAbsent = false;
   const stack = [...tips];
   while (stack.length > 0) {
     const sha = stack.pop() as string;
     if (into.has(sha)) continue;
     const object = getObject(repo, sha);
-    if (object === null) continue;
+    if (object === null) {
+      hitAbsent = true;
+      continue;
+    }
     into.add(sha);
     if (object.type === 'commit') {
       const info = parseCommit(object.data);
@@ -63,32 +104,13 @@ function fullClosure(repo: RepoRec, tips: string[], into: Set<string>, stopAt?: 
       // itself, but its ancestry is exactly what it does not have.
       if (stopAt === undefined || !stopAt.has(sha)) stack.push(...info.parents);
     } else if (object.type === 'tree') {
-      for (const entry of treeEntries(repo, sha)) stack.push(entry.sha);
+      for (const entry of parseTree(object.data)) stack.push(entry.sha);
     } else if (object.type === 'tag') {
       const target = peel(repo, sha);
       stack.push(target.sha);
     }
   }
-}
-
-/** Tree entries of a tree sha (empty for anything else). */
-function treeEntries(repo: RepoRec, treeSha: string): { mode: string; name: string; sha: string }[] {
-  const object = getObject(repo, treeSha);
-  if (object === null || object.type !== 'tree') return [];
-  const entries: { mode: string; name: string; sha: string }[] = [];
-  let offset = 0;
-  const data = object.data;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
-    const nul = data.indexOf(0x00, space);
-    entries.push({
-      mode: data.toString('utf8', offset, space),
-      name: data.toString('utf8', space + 1, nul),
-      sha: data.toString('hex', nul + 1, nul + 21),
-    });
-    offset = nul + 21;
-  }
-  return entries;
+  return hitAbsent;
 }
 
 interface Filter {
@@ -140,11 +162,63 @@ interface FetchPlan {
   common: string[];
 }
 
+/**
+ * Fetch plans memoize per repository when the request is a pure function
+ * of the object store's immutable contents: every want, have and shallow
+ * sha it names exists, it carries no deepen-not (the one input resolved
+ * through the mutable refs), and the walk below met no missing object —
+ * a walk that skipped over an absent object could plan differently once
+ * that object arrives, so such plans are computed fresh every time.
+ */
+const planCache = new WeakMap<RepoRec, Map<string, FetchPlan>>();
+const PLAN_CACHE_MAX = 64;
+
+/** The memo key for a fetch request, or null when it may not be memoized. */
+function planCacheKey(repo: RepoRec, request: FetchRequest): string | null {
+  if (request.deepenNot.length > 0) return null;
+  for (const sha of request.wants) if (!repo.objects.has(sha)) return null;
+  for (const sha of request.haves) if (!repo.objects.has(sha)) return null;
+  for (const sha of request.clientShallow) if (!repo.objects.has(sha)) return null;
+  const filter = request.filter === null ? '' : `${request.filter.kind}:${request.filter.limit}`;
+  return [
+    request.wants.join(' '),
+    request.haves.join(' '),
+    request.clientShallow.join(' '),
+    request.depth ?? '',
+    request.deepenSince ?? '',
+    filter,
+  ].join('|');
+}
+
 /** Work out exactly which objects a fetch sends, and its shallow boundary. */
 function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
+  const cacheKey = planCacheKey(repo, request);
+  if (cacheKey !== null) {
+    const cached = planCache.get(repo)?.get(cacheKey);
+    if (cached !== undefined) return cached;
+  }
+  const plan = computePlan(repo, request);
+  if (cacheKey !== null && !plan.hitAbsent) {
+    let perRepo = planCache.get(repo);
+    if (perRepo === undefined) {
+      perRepo = new Map();
+      planCache.set(repo, perRepo);
+    }
+    if (perRepo.size >= PLAN_CACHE_MAX) {
+      const oldest = perRepo.keys().next().value;
+      if (oldest !== undefined) perRepo.delete(oldest);
+    }
+    perRepo.set(cacheKey, plan);
+  }
+  return plan;
+}
+
+/** The plan walk itself, behind planFetch's memo. */
+function computePlan(repo: RepoRec, request: FetchRequest): FetchPlan & { hitAbsent: boolean } {
+  let hitAbsent = false;
   const shallowSet = new Set(request.clientShallow);
   const known = new Set<string>();
-  fullClosure(repo, request.haves, known, shallowSet);
+  if (fullClosure(repo, request.haves, known, shallowSet)) hitAbsent = true;
   for (const ref of request.deepenNot) {
     const tip = store.branchTip(repo, ref.replace(/^refs\/heads\//, '')) ?? repo.refs.get(ref);
     if (tip !== undefined) fullClosure(repo, [tip], known);
@@ -160,20 +234,37 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
   const includeObject = (sha: string): void => {
     if (included.has(sha) || known.has(sha)) return;
     const object = getObject(repo, sha);
-    if (object === null) return;
+    if (object === null) {
+      hitAbsent = true;
+      return;
+    }
     included.set(sha, object);
   };
   const includeTree = (treeSha: string, depth: number): void => {
+    // A tree already in the pack needs no second walk — its entries were
+    // included with it — unless the filter is a tree-depth one: there the
+    // same tree can sit at different depths in different commits, and a
+    // later, shallower visit can include what a deeper one cut off, so
+    // those walks repeat exactly as an unmemoized walk would.
+    if (known.has(treeSha)) return;
+    if (included.has(treeSha) && request.filter?.kind !== 'tree-depth') return;
     const object = getObject(repo, treeSha);
-    if (object === null || known.has(treeSha)) return;
+    if (object === null) {
+      hitAbsent = true;
+      return;
+    }
     if (!passesFilter(object, request.filter, depth)) return;
-    includeObject(treeSha);
-    for (const entry of treeEntries(repo, treeSha)) {
+    included.set(treeSha, object);
+    for (const entry of parseTree(object.data)) {
       if (entry.mode === '40000') {
         includeTree(entry.sha, depth + 1);
-      } else {
+      } else if (!included.has(entry.sha) && !known.has(entry.sha)) {
         const blob = getObject(repo, entry.sha);
-        if (blob !== null && !known.has(entry.sha) && passesFilter(blob, request.filter, depth)) includeObject(entry.sha);
+        if (blob === null) {
+          hitAbsent = true;
+        } else if (passesFilter(blob, request.filter, depth)) {
+          included.set(entry.sha, blob);
+        }
       }
     }
   };
@@ -182,20 +273,28 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
   // The walk goes through commits the client already has — a shallow
   // boundary named as a have is the classic case — leaving known objects
   // out of the pack but still reaching the generations below them, which
-  // is exactly what a deepen asks for.
-  const queue: { sha: string; generation: number }[] = [];
+  // is exactly what a deepen asks for. Two parallel arrays, not an object
+  // per commit: a long history enqueues every ancestor.
+  const queueShas: string[] = [];
+  const queueGens: number[] = [];
   const seen = new Set<string>();
   for (const want of request.wants) {
     const object = getObject(repo, want);
-    if (object === null) continue;
-    if (object.type === 'commit') queue.push({ sha: want, generation: 0 });
-    else if (object.type === 'tree') includeTree(want, 0);
+    if (object === null) {
+      hitAbsent = true;
+      continue;
+    }
+    if (object.type === 'commit') {
+      queueShas.push(want);
+      queueGens.push(0);
+    } else if (object.type === 'tree') includeTree(want, 0);
     else includeObject(want);
   }
   // An index cursor, not shift(): the walk is breadth-first either way and
   // a long history must not pay a memmove per commit.
-  for (let head = 0; head < queue.length; head += 1) {
-    const { sha, generation } = queue[head] as { sha: string; generation: number };
+  for (let head = 0; head < queueShas.length; head += 1) {
+    const sha = queueShas[head] as string;
+    const generation = queueGens[head] as number;
     if (seen.has(sha)) continue;
     seen.add(sha);
     const object = getObject(repo, sha);
@@ -209,11 +308,15 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
       includeTree(info.tree, 0);
     }
     for (const parent of info.parents) {
-      if (getObject(repo, parent) === null) continue;
+      if (getObject(repo, parent) === null) {
+        hitAbsent = true;
+        continue;
+      }
       const parentWithinDepth = request.depth === null || generation + 1 < request.depth;
       const parentWithinSince = request.deepenSince === null || commitTime(repo, parent) >= request.deepenSince;
       if (parentWithinDepth && parentWithinSince) {
-        queue.push({ sha: parent, generation: generation + 1 });
+        queueShas.push(parent);
+        queueGens.push(generation + 1);
       } else if (isIncluded && !known.has(parent)) {
         // A parent exists but the depth/since gate cut it off: this
         // commit is the shallow boundary of the new pack.
@@ -236,39 +339,66 @@ function planFetch(repo: RepoRec, request: FetchRequest): FetchPlan {
     shallow: [...boundary],
     unshallow,
     common: request.haves.filter((sha) => getObject(repo, sha) !== null),
+    hitAbsent,
   };
 }
 
 /**
- * Pack buffers repeat constantly in a trial (fifty clones of one repo ask
- * for the same objects), and a pack is a pure function of its object list,
- * which is content-addressed: memoize built packs by their object shas.
+ * Framed pack buffers repeat constantly in a trial (fifty clones of one
+ * repo ask for the same objects), and a pack is a pure function of its
+ * object list, which is content-addressed: memoize the sideband-framed
+ * pack by its object shas, so a repeat fetch copies nothing at all — the
+ * cached buffer goes straight to the socket.
  */
-const packCache = new Map<string, Buffer>();
+const framedPackCache = new Map<string, Buffer>();
 
-/** Build (or fetch from the cache) the pack for a fetch plan. */
-function packFor(plan: FetchPlan): Buffer {
-  const cached = packCache.get(plan.key);
-  if (cached !== undefined) return cached;
-  const pack = buildPack(plan.objects);
-  if (packCache.size >= 128) {
-    const oldest = packCache.keys().next().value;
-    if (oldest !== undefined) packCache.delete(oldest);
+/** Frame pack bytes as sideband-64k packets (band 1) in one allocation. */
+function frameSideband(pack: Buffer): Buffer {
+  const CHUNK = 32768;
+  const chunks = Math.max(1, Math.ceil(pack.length / CHUNK));
+  const out = Buffer.allocUnsafe(pack.length + chunks * 5);
+  let read = 0;
+  let written = 0;
+  for (let i = 0; i < chunks; i += 1) {
+    const count = Math.min(CHUNK, pack.length - read);
+    writePktLength(out, written, count + 5);
+    out[written + 4] = 1;
+    pack.copy(out, written + 5, read, read + count);
+    read += count;
+    written += count + 5;
   }
-  packCache.set(plan.key, pack);
-  return pack;
+  return out;
 }
 
-/** Frame pack bytes as sideband-64k packets (band 1), chunked well under the limit. */
-function sidebandPackets(pack: Buffer): Buffer[] {
-  const packets: Buffer[] = [];
-  const CHUNK = 32768;
-  for (let offset = 0; offset < pack.length; offset += CHUNK) {
-    const chunk = pack.subarray(offset, offset + CHUNK);
-    packets.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+/** Build (or fetch from the cache) the framed pack for a fetch plan. */
+function framedPackFor(plan: FetchPlan): Buffer {
+  const cached = framedPackCache.get(plan.key);
+  if (cached !== undefined) return cached;
+  const framed = frameSideband(buildPack(plan.objects));
+  if (framedPackCache.size >= 128) {
+    const oldest = framedPackCache.keys().next().value;
+    if (oldest !== undefined) framedPackCache.delete(oldest);
   }
-  if (packets.length === 0) packets.push(pktLine(Buffer.from([1])));
-  return packets;
+  framedPackCache.set(plan.key, framed);
+  return framed;
+}
+
+/**
+ * Answer with several buffers written in order: the same bytes and the
+ * same headers sendBytes would send for their concatenation, without the
+ * copy a concatenation of a large pack would make.
+ */
+function sendParts(ctx: Ctx, status: number, parts: Buffer[], contentType: string, headers: Record<string, string> = {}): void {
+  let length = 0;
+  for (const part of parts) length += part.length;
+  ctx.res.writeHead(status, {
+    'content-type': contentType,
+    'content-length': length,
+    'x-github-request-id': store.nextRequestId(),
+    ...headers,
+  });
+  for (const part of parts) ctx.res.write(part);
+  ctx.res.end();
 }
 
 /** The v2 capability advertisement: the same bytes for every repository and every request. */
@@ -301,11 +431,21 @@ function advertisement(ctx: Ctx, repo: RepoRec, service: string): void {
   return sendBytes(ctx, 200, Buffer.concat(parts), `application/x-${service}-advertisement`, { 'cache-control': 'no-cache' });
 }
 
+/**
+ * A packet payload as a text line (no trailing newline). The newline is
+ * stripped by length, not by regex: a 0x0a byte can only be the newline
+ * itself, never part of a multi-byte utf8 sequence.
+ */
+function lineText(payload: Buffer): string {
+  const end = payload.length > 0 && payload[payload.length - 1] === 0x0a ? payload.length - 1 : payload.length;
+  return payload.toString('utf8', 0, end);
+}
+
 /** Data payloads of a packet list as text lines (no trailing newline). */
 function linesOf(packets: Packet[]): string[] {
   const lines: string[] = [];
   for (const packet of packets) {
-    if (packet.kind === 'data') lines.push(packet.payload.toString('utf8').replace(/\n$/, ''));
+    if (packet.kind === 'data') lines.push(lineText(packet.payload));
   }
   return lines;
 }
@@ -389,7 +529,7 @@ function uploadPack(ctx: Ctx, repo: RepoRec): void {
         continue;
       }
       if (packet.kind !== 'data') continue;
-      const line = packet.payload.toString('utf8').replace(/\n$/, '');
+      const line = lineText(packet.payload);
       if (!pastDelim) {
         if (line.startsWith('command=')) command = line.slice('command='.length);
       } else {
@@ -435,9 +575,9 @@ function uploadPack(ctx: Ctx, repo: RepoRec): void {
         parts.push(pktDelim());
       }
       parts.push(pktLine('packfile\n'));
-      parts.push(...sidebandPackets(packFor(plan)));
+      parts.push(framedPackFor(plan));
       parts.push(pktFlush());
-      return sendBytes(ctx, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
+      return sendParts(ctx, 200, parts, 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
     }
     return sendError(ctx, 400, 'Bad Request');
   }
@@ -451,9 +591,9 @@ function uploadPack(ctx: Ctx, repo: RepoRec): void {
   for (const sha of plan.unshallow) parts.push(pktLine(`unshallow ${sha}\n`));
   if (plan.common.length > 0) parts.push(pktLine(`ACK ${plan.common[0]}\n`));
   else parts.push(pktLine('NAK\n'));
-  parts.push(...sidebandPackets(packFor(plan)));
+  parts.push(framedPackFor(plan));
   parts.push(pktFlush());
-  return sendBytes(ctx, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
+  return sendParts(ctx, 200, parts, 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
 }
 
 interface RefUpdate {
@@ -567,7 +707,9 @@ export function handleGit(ctx: Ctx): void {
     sendError(ctx, 404, 'Not Found');
     return;
   }
-  const tail = ctx.segments.slice(2).join('/');
+  // Every git tail is a single segment (info/refs, git-upload-pack,
+  // git-receive-pack); only a longer path pays for the slice and join.
+  const tail = ctx.segments.length === 3 ? (ctx.segments[2] as string) : ctx.segments.slice(2).join('/');
   const service = ctx.query.get('service');
   if (ctx.method === 'GET' && tail === 'info/refs' && (service === 'git-upload-pack' || service === 'git-receive-pack')) {
     advertisement(ctx, repo, service);

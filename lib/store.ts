@@ -131,8 +131,18 @@ export interface TreeEntry {
   sha: string;
 }
 
+/**
+ * Tree parses are pure functions of an object's bytes, and a stored
+ * object's buffer is never mutated, so parses memoize by buffer identity:
+ * a fetch walk re-reads the same trees on every request. Callers treat the
+ * returned entries as read-only (they only ever read them).
+ */
+const treeEntriesCache = new WeakMap<Buffer, TreeEntry[]>();
+
 /** Parse a raw tree object into its entries. */
 export function parseTree(data: Buffer): TreeEntry[] {
+  const cached = treeEntriesCache.get(data);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -144,6 +154,7 @@ export function parseTree(data: Buffer): TreeEntry[] {
     entries.push({ mode, name, sha });
     offset = nul + 21;
   }
+  treeEntriesCache.set(data, entries);
   return entries;
 }
 
@@ -215,8 +226,20 @@ export interface CommitInfo {
   committerLine: string;
 }
 
+/** Commit parses memoize by buffer identity, like tree parses (above). */
+const commitInfoCache = new WeakMap<Buffer, CommitInfo>();
+
 /** Parse a raw commit object. */
 export function parseCommit(data: Buffer): CommitInfo {
+  const cached = commitInfoCache.get(data);
+  if (cached !== undefined) return cached;
+  const info = parseCommitFresh(data);
+  commitInfoCache.set(data, info);
+  return info;
+}
+
+/** The uncached commit parse behind parseCommit's memo. */
+function parseCommitFresh(data: Buffer): CommitInfo {
   // Decode the header alone for the line scan, and the message apart: the
   // byte index of the blank line is the char index too (a 0x0a byte never
   // appears inside a multi-byte utf8 sequence).

@@ -12,12 +12,30 @@ export const ZERO_SHA = '0000000000000000000000000000000000000000';
 const TYPE_CODES: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const CODE_TYPES: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** Write a pkt-line length as 4 lowercase hex digits at `offset`. */
+export function writePktLength(out: Buffer, offset: number, length: number): void {
+  out[offset] = HEX_DIGITS.charCodeAt((length >>> 12) & 0xf);
+  out[offset + 1] = HEX_DIGITS.charCodeAt((length >>> 8) & 0xf);
+  out[offset + 2] = HEX_DIGITS.charCodeAt((length >>> 4) & 0xf);
+  out[offset + 3] = HEX_DIGITS.charCodeAt(length & 0xf);
+}
+
 /** Frame one pkt-line: 4 hex digits of total length + payload. */
 export function pktLine(payload: Buffer | string): Buffer {
-  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const length = data.length + 4;
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([header, data]);
+  if (typeof payload === 'string') {
+    const length = Buffer.byteLength(payload, 'utf8') + 4;
+    const out = Buffer.allocUnsafe(length);
+    writePktLength(out, 0, length);
+    out.write(payload, 4, 'utf8');
+    return out;
+  }
+  const length = payload.length + 4;
+  const out = Buffer.allocUnsafe(length);
+  writePktLength(out, 0, length);
+  payload.copy(out, 4);
+  return out;
 }
 
 /** The flush packet (0000). */
@@ -33,6 +51,25 @@ export function pktDelim(): Buffer {
 export type Packet = { kind: 'data'; payload: Buffer } | { kind: 'flush' } | { kind: 'delim' };
 
 /**
+ * The pkt-line length named by the 4 bytes at `offset`, or -1 when they
+ * are not exactly 4 lowercase hex digits (the framing the parser accepts).
+ * Reads char codes directly: a request body carries a packet per line, and
+ * a regex over a fresh string per packet was measurable on every POST.
+ */
+function pktLengthAt(buffer: Buffer, offset: number): number {
+  let value = 0;
+  for (let i = 0; i < 4; i += 1) {
+    const code = buffer[offset + i] as number;
+    let digit: number;
+    if (code >= 0x30 && code <= 0x39) digit = code - 0x30;
+    else if (code >= 0x61 && code <= 0x66) digit = code - 0x57;
+    else return -1;
+    value = (value << 4) | digit;
+  }
+  return value;
+}
+
+/**
  * Split a buffer into pkt-line packets. Returns the packets plus any
  * trailing bytes that are not pkt-framed (a packfile after a flush, in
  * receive-pack requests).
@@ -41,9 +78,8 @@ export function parsePackets(buffer: Buffer): { packets: Packet[]; rest: Buffer 
   const packets: Packet[] = [];
   let offset = 0;
   while (offset + 4 <= buffer.length) {
-    const header = buffer.toString('ascii', offset, offset + 4);
-    if (!/^[0-9a-f]{4}$/.test(header)) break;
-    const length = parseInt(header, 16);
+    const length = pktLengthAt(buffer, offset);
+    if (length < 0) break;
     if (length === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -64,7 +100,7 @@ export function parsePackets(buffer: Buffer): { packets: Packet[]; rest: Buffer 
     packets.push({ kind: 'data', payload: buffer.subarray(offset + 4, offset + length) });
     offset += length;
     // A data packet may be the last one; keep scanning for framing.
-    if (offset + 4 <= buffer.length && !/^[0-9a-f]{4}$/.test(buffer.toString('ascii', offset, offset + 4))) break;
+    if (offset + 4 <= buffer.length && pktLengthAt(buffer, offset) < 0) break;
   }
   return { packets, rest: buffer.subarray(offset) };
 }
@@ -77,9 +113,8 @@ export function parseAllPackets(buffer: Buffer): Packet[] {
   const packets: Packet[] = [];
   let offset = 0;
   while (offset + 4 <= buffer.length) {
-    const header = buffer.toString('ascii', offset, offset + 4);
-    if (!/^[0-9a-f]{4}$/.test(header)) break;
-    const length = parseInt(header, 16);
+    const length = pktLengthAt(buffer, offset);
+    if (length < 0) break;
     if (length === 0) {
       packets.push({ kind: 'flush' });
       offset += 4;
@@ -114,6 +149,28 @@ function packObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+/**
+ * Deflated pack entries memoize by object identity: a stored object is
+ * immutable, so its entry (header + deflated bytes) is a pure function of
+ * the object, and successive fetches of one repository overlap heavily —
+ * a subset fetch reuses the entries the full fetch already paid to deflate
+ * instead of deflating every object again. The bytes are unchanged.
+ */
+const packEntryCache = new WeakMap<GitObject, Buffer>();
+
+/** One object's pack entry: its header followed by its deflated data. */
+function packEntry(object: GitObject): Buffer {
+  const cached = packEntryCache.get(object);
+  if (cached !== undefined) return cached;
+  const header = packObjectHeader(object.type, object.data.length);
+  const deflated = deflateSync(object.data);
+  const entry = Buffer.allocUnsafe(header.length + deflated.length);
+  header.copy(entry, 0);
+  deflated.copy(entry, header.length);
+  packEntryCache.set(object, entry);
+  return entry;
+}
+
 /** Build a complete packfile (version 2, sha1 trailer) from full objects. */
 export function buildPack(objects: GitObject[]): Buffer {
   const parts: Buffer[] = [];
@@ -123,8 +180,7 @@ export function buildPack(objects: GitObject[]): Buffer {
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
   for (const object of objects) {
-    parts.push(packObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(packEntry(object));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
