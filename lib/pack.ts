@@ -152,6 +152,17 @@ function tryInflate(buffer: Buffer, offset: number, length: number): Buffer | nu
   }
 }
 
+/** The adler32 checksum a zlib stream ends with, over its inflated bytes. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + (data[i] as number)) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
  * The exact byte length of the stream at `offset` when it is stored-format
  * (BTYPE=00 blocks only — what an encoder emits for incompressible data),
@@ -191,9 +202,12 @@ function storedStreamLength(buffer: Buffer, offset: number, size: number): numbe
  * The search starts at the stored bound (see storedBound): for the common
  * case of incompressible data the stream ends exactly there, which two
  * probes settle — one at the bound (whose result is the object's data) and
- * one a byte shorter (which must fail). Anything shorter falls back to a
- * binary search under the bound; anything longer (a stream no real encoder
- * writes) falls back to a binary search of the whole remainder. `size` is
+ * one a byte shorter (which must fail). A shorter stream's end is named by
+ * its own adler32 trailer: one scan for those 4 bytes plus one verifying
+ * inflate settles it, with the re-deflate reproduction and then a binary
+ * search under the bound as fallbacks; anything longer than the bound (a
+ * stream no real encoder writes) falls back to a binary search of the
+ * whole remainder. `size` is
  * the object's inflated length from its pack header; `endHint`, when the
  * caller knows where the stream must end (the last object in a pack ends
  * 20 bytes before the buffer does, at the pack trailer), is tried first.
@@ -214,11 +228,38 @@ function inflatedLength(buffer: Buffer, offset: number, size: number, endHint?: 
   }
   let data = tryInflate(buffer, offset, bound);
   if (data !== null) {
-    // The data is known now; only its stream's exact length is not. One
-    // re-deflate at the default level reproduces the stream byte for byte
-    // for the encoders git clients use — when it matches the pack's bytes,
-    // its length is the answer, with no further probes. A mismatch (some
-    // other level or strategy) just falls through to the probes below.
+    // The data is known now; only its stream's exact length is not. The
+    // stream ends with the adler32 of its own data, big-endian: scan for
+    // that 4-byte needle (a memmem, not a probe) and verify each candidate
+    // end by inflating exactly that prefix. The first candidate is the end
+    // for any stream a real encoder wrote — an adler collision inside one
+    // object's span is rare, and a false candidate simply fails its verify
+    // and the scan moves on. This settles the length with one extra
+    // inflate where the re-deflate reproduction below needs a full deflate
+    // — and where a different encoder level made that reproduction miss
+    // entirely, it avoids the long binary search of probes.
+    if (data.length === size) {
+      const sum = adler32(data);
+      const needle = Buffer.from([(sum >>> 24) & 0xff, (sum >>> 16) & 0xff, (sum >>> 8) & 0xff, sum & 0xff]);
+      const lastStart = offset + bound - 4;
+      // The scan starts right after the 2-byte wrapper — the earliest a
+      // trailer can sit — so the true end is always among the candidates:
+      // a shorter candidate's verify inflate throws (the stream is
+      // incomplete there), and the true end verifies first.
+      let searchFrom = offset + 2;
+      while (searchFrom <= lastStart) {
+        const at = buffer.indexOf(needle, searchFrom);
+        if (at === -1 || at > lastStart) break;
+        const consumed = at + 4 - offset;
+        const check = tryInflate(buffer, offset, consumed);
+        if (check !== null && check.length === size && check.equals(data)) return { data, consumed };
+        searchFrom = at + 1;
+      }
+    }
+    // One re-deflate at the default level reproduces the stream byte for
+    // byte for the encoders git clients use — when it matches the pack's
+    // bytes, its length is the answer, with no further probes. A mismatch
+    // (some other level or strategy) just falls through to the probes below.
     if (data.length === size && bound > 8) {
       const redeflated = deflateSync(data);
       if (redeflated.length < bound && buffer.subarray(offset, offset + redeflated.length).equals(redeflated)) {

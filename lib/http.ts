@@ -27,8 +27,19 @@ export interface Ctx {
   jsonError: boolean;
 }
 
+/** The shared empty body for requests that carry none. */
+const EMPTY_BODY = Buffer.alloc(0);
+
 /** Read a request body to the end. */
 export function readBody(req: IncomingMessage): Promise<Buffer> {
+  // A request with no Content-Length and no Transfer-Encoding has no body
+  // by definition: answer at once instead of waiting a stream turn for an
+  // 'end' that carries nothing. Most GETs (every advertisement, every REST
+  // read) take this path.
+  const length = req.headers['content-length'];
+  if ((length === undefined || length === '0') && req.headers['transfer-encoding'] === undefined) {
+    return Promise.resolve(EMPTY_BODY);
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -64,7 +75,11 @@ export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer)
   let json: Record<string, unknown> | undefined;
   let jsonRaw: unknown;
   let jsonError = false;
-  if (body.length > 0) {
+  // Git smart-HTTP bodies are pkt-lines and pack bytes, never JSON, and no
+  // git handler reads the parsed body: skip the utf8 decode and the doomed
+  // JSON.parse of a binary pack on every push and fetch.
+  const isGit = segments.length >= 2 && (segments[1] as string).endsWith('.git');
+  if (body.length > 0 && !isGit) {
     try {
       const parsed: unknown = JSON.parse(body.toString('utf8'));
       jsonRaw = parsed;
@@ -79,14 +94,27 @@ export function makeCtx(req: IncomingMessage, res: ServerResponse, body: Buffer)
 
 /** Answer with a JSON body and the headers every reply must carry. */
 export function sendJson(ctx: Ctx, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  // Encode once: the buffer's length is the content length, and handing the
+  // socket a buffer skips the second utf8 pass res.end(string) would make.
+  const data = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   ctx.res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': data.length,
     'x-github-request-id': store.nextRequestId(),
     ...headers,
   });
-  ctx.res.end(text);
+  ctx.res.end(data);
+}
+
+/** Answer with a pre-encoded JSON body (a memoized serialization). */
+export function sendJsonBuffer(ctx: Ctx, status: number, data: Buffer, headers: Record<string, string> = {}): void {
+  ctx.res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': data.length,
+    'x-github-request-id': store.nextRequestId(),
+    ...headers,
+  });
+  ctx.res.end(data);
 }
 
 /** Answer with raw bytes (git protocol replies, packfiles). */
@@ -105,10 +133,16 @@ export function sendError(ctx: Ctx, status: number, message: string): void {
   sendJson(ctx, status, { message });
 }
 
+/** The bearer token, read from the environment once (it never changes under a running trial). */
+let tokenCache: string | null | undefined;
+
 /** The bearer token the trial issued, or null when none is configured. */
 export function expectedToken(): string | null {
-  const token = process.env.MAKEFUN_SHOP_TOKEN;
-  return token === undefined || token === '' ? null : token;
+  if (tokenCache === undefined) {
+    const token = process.env.MAKEFUN_SHOP_TOKEN;
+    tokenCache = token === undefined || token === '' ? null : token;
+  }
+  return tokenCache;
 }
 
 /**

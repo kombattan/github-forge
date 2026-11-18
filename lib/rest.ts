@@ -18,7 +18,7 @@ import {
   type PullRec,
   type RepoRec,
 } from './store.ts';
-import { sendError, sendJson, type Ctx } from './http.ts';
+import { sendError, sendJson, sendJsonBuffer, type Ctx } from './http.ts';
 
 /** A string field from a JSON body, or null when absent/not a string. */
 function str(body: Record<string, unknown>, key: string): string | null {
@@ -101,6 +101,37 @@ export function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknow
     html_url: '',
     url: '',
   };
+}
+
+/**
+ * Memoized serializations of issue objects, one per issue record. An
+ * issue's rendered body is a pure function of its own mutable fields plus
+ * its labels' (immutable-after-creation) color and description, so the
+ * cache key is built from exactly those fields: any write that could
+ * change the rendering changes the key, and an equal key renders equal
+ * bytes. Reads of one issue (the hot pattern) then cost a key build and a
+ * buffer send instead of an object build and a stringify.
+ */
+const issueBodyCache = new WeakMap<IssueRec, { key: string; data: Buffer }>();
+
+/** The cache key for an issue's rendered body: every field that feeds it. */
+function issueBodyKey(repo: RepoRec, issue: IssueRec): string {
+  let key = `${issue.updatedAt}|${issue.comments.length}|${issue.state}|${issue.title}|${issue.body ?? ''}|`;
+  for (const name of issue.labels) {
+    const label = repo.labels.get(name);
+    key += `${name}=${label?.color ?? 'ededed'}:${label?.description ?? ''};`;
+  }
+  return key;
+}
+
+/** An issue's rendered body as bytes, rebuilt only when its key changes. */
+function issueBodyBuffer(repo: RepoRec, issue: IssueRec): Buffer {
+  const key = issueBodyKey(repo, issue);
+  const hit = issueBodyCache.get(issue);
+  if (hit !== undefined && hit.key === key) return hit.data;
+  const data = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueBodyCache.set(issue, { key, data });
+  return data;
 }
 
 /** The pull request object as REST returns it. */
@@ -563,7 +594,7 @@ function handleIssues(ctx: Ctx, repo: RepoRec, seg: string[], body: Record<strin
     return sendError(ctx, 404, 'Not Found');
   }
   if (issue === undefined) return sendError(ctx, 404, 'Not Found');
-  if (ctx.method === 'GET' && seg.length === 1) return sendJson(ctx, 200, issueJson(repo, issue));
+  if (ctx.method === 'GET' && seg.length === 1) return sendJsonBuffer(ctx, 200, issueBodyBuffer(repo, issue));
   if (ctx.method === 'PATCH' && seg.length === 1) {
     const bad = labelError(repo, body);
     if (bad !== null) return sendError(ctx, 422, bad);

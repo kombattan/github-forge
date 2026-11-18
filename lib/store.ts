@@ -217,10 +217,12 @@ export interface CommitInfo {
 
 /** Parse a raw commit object. */
 export function parseCommit(data: Buffer): CommitInfo {
-  const text = data.toString('utf8');
-  const split = text.indexOf('\n\n');
-  const head = split === -1 ? text : text.slice(0, split);
-  const message = split === -1 ? '' : text.slice(split + 2);
+  // Decode the header alone for the line scan, and the message apart: the
+  // byte index of the blank line is the char index too (a 0x0a byte never
+  // appears inside a multi-byte utf8 sequence).
+  const split = data.indexOf('\n\n');
+  const head = split === -1 ? data.toString('utf8') : data.toString('utf8', 0, split);
+  const message = split === -1 ? '' : data.toString('utf8', split + 2);
   let tree = '';
   let authorLine = '';
   let committerLine = '';
